@@ -28,13 +28,37 @@ The script contains no code that changes any of the following:
 
 At the end of every run it writes a **read-only** Defender and BitLocker status line to the log so you can confirm both are still on.
 
+## Drift detection
+
+Every setting is checked before anything is written:
+
+- **Already correct:** left alone and only counted.
+- **Missing or different:** corrected and logged as a `CHANGE` line, showing the old and new value. Each one counts as **drift**.
+
+Example log lines:
+
+```
+2026-11-23 12:15:04 [CHANGE] HKLM:\SOFTWARE\Policies\Microsoft\Edge\ShowRecommendationsEnabled: 1 (DWord) -> 0
+2026-11-23 12:15:09 [CHANGE] Xbox Game Bar: removed Microsoft.XboxGamingOverlay_7.325.11061.0_x64__8wekyb3d8bbwe for all users
+```
+
+The run ends with a summary of every change, and the very last output line is always:
+
+```
+WWDEBLOAT_RESULT: errors=0 drift=2
+```
+
+The first run on a PC reports many changes, because nothing was configured yet. After that, a clean PC reports `drift=0`, and any number above zero means something (usually a Windows feature update or a user) changed a setting back.
+
+See [Running daily in NinjaOne](#running-daily-in-ninjaone) for how to alert on drift.
+
 ## What it does
 
 The script runs in four stages. Each stage can be skipped (see [Options](#options)).
 
 ### 1. Restore point
 
-Turns on System Protection for the system drive if it is off, then creates a restore point named `WWDebloat 1.0.0 pre-change` before anything else changes.
+Turns on System Protection for the system drive if it is off, then creates a restore point named `WWDebloat <version> pre-change` before anything else changes.
 
 Windows normally refuses to create a restore point if one was made in the last 24 hours. The script lifts that limit for this single restore point and then puts the original setting back.
 
@@ -241,11 +265,24 @@ Set options either as script parameters or as NinjaOne script variables with the
 | `HideStartRecommendedSection` | Checkbox / switch | Off | Hide the entire Start menu Recommended section (see caveat above) |
 | `ResetComponentBase` | Checkbox / switch | Off | Add `/ResetBase` to DISM (updates become uninstallable) |
 | `TempFileAgeDays` | Integer | 7 | Minimum age, in days, of temp files to delete (1 to 365) |
+| `EnforceOnly` | Checkbox / switch | Off | Daily enforcement mode. See below |
+| `FailOnDrift` | Checkbox / switch | Off | Exit with code 3 when drift was found and corrected, so NinjaOne marks the run as failed |
+| `DriftCustomField` | Text | (none) | Name of a NinjaOne text custom field to write a one-line result to, for example `wwdebloatStatus` |
 
-Command-line example:
+**`EnforceOnly`** is the mode for scheduled daily runs. It:
+
+- Re-applies the app removals and tweaks only.
+- Skips the restore point and all cleanup (as if `SkipRestorePoint` and `SkipCleanup` were set). A restore point every day would push out the older ones you might actually need, and Windows already runs component cleanup on its own schedule.
+- Only touches the registry of users who are **signed in** at the time. It never loads a signed-out user's registry or the Default profile, so there is no chance of a user signing in mid-run and getting a temporary profile. Signed-out users are covered by the next run that happens while they are signed in.
+
+Command-line examples:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\WWDebloat.ps1 -SkipCleanup -TempFileAgeDays 14
+# First run / monthly full run
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\WWDebloat.ps1
+
+# Daily enforcement with drift alerting
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\WWDebloat.ps1 -EnforceOnly -FailOnDrift -DriftCustomField wwdebloatStatus
 ```
 
 ## NinjaOne setup
@@ -263,15 +300,74 @@ The full log appears in the NinjaOne activity output and is also saved on the PC
 
 **Recommended rollout:** run it on one or two pilot PCs first, confirm users can still work normally, then deploy to the rest.
 
+## Running daily in NinjaOne
+
+Use two schedules: a daily lightweight enforcement run and a monthly full run. NinjaOne menu names shift slightly between versions; the steps below describe the current layout.
+
+### 1. Optional: create a custom field for drift status
+
+**Administration > Devices > Global Custom Fields > Add**
+
+- Type: **Text**
+- Name: `wwdebloatStatus` (any name works; use the same name in `DriftCustomField`)
+- Automations: **Read/Write**
+
+Each run writes one of these to the field:
+
+```
+2026-11-23 12:15 | OK | no drift (EnforceOnly)
+2026-11-23 12:15 | DRIFT | 3 item(s) corrected (EnforceOnly)
+2026-11-23 12:15 | ERRORS | 1 error(s), 0 drift item(s) corrected (EnforceOnly)
+```
+
+Add the field as a column in a device list, or filter devices where it contains `DRIFT` or `ERRORS`, to see every affected PC at once.
+
+### 2. Daily enforcement schedule
+
+**Administration > Policies > (your Windows workstation policy) > Scheduled Automations > Add**
+
+- Script: **WWDebloat**
+- Schedule: **Daily**, around midday (for example 12:15) when most users are signed in
+- Run As: **System**
+- Preset parameters: `-EnforceOnly -DriftCustomField wwdebloatStatus`
+  - Add `-FailOnDrift` if you want drift to show as a failed run in the activity log
+- Do **not** turn on running missed schedules when the device comes back online. That fires the run right as users sign in, which is the least useful time.
+
+A daily run with nothing to fix should finish in a minute or two.
+
+### 3. Monthly full schedule
+
+Add a second scheduled automation on the same policy:
+
+- Script: **WWDebloat**
+- Schedule: **Monthly**, outside business hours (for example the Saturday after Patch Tuesday)
+- Run As: **System**, timeout 60 minutes
+- Preset parameters: none (or `-DriftCustomField wwdebloatStatus`)
+
+This run creates a fresh restore point, cleans up disk space, and applies per-user settings to users who were signed out during the daily runs, plus the Default profile.
+
+### 4. Alerting on drift (pick one)
+
+| Method | How |
+|---|---|
+| **Custom field** | Filter devices on `wwdebloatStatus` containing `DRIFT` or `ERRORS`. Best for a daily review without alert noise |
+| **Failed activity** | Add `-FailOnDrift` to the daily schedule. Drift returns exit code 3 and shows as a failed script run |
+| **Policy condition** | Create a **Script Result Condition** on the policy that runs WWDebloat with `-EnforceOnly -FailOnDrift` and alerts or creates a ticket when the result code is not 0. Use this instead of (not in addition to) the daily scheduled automation |
+
+Expect the first daily run after deployment to report drift on every PC; that is the initial configuration, not a problem. After that, drift usually points to a Windows feature update, or to a user turning something back on.
+
 ## Exit codes
 
 | Code | Meaning |
 |---|---|
-| 0 | Completed with no errors (warnings are possible; check the log) |
+| 0 | Completed with no errors (warnings are possible; check the log). With `FailOnDrift`, also means no drift |
 | 1 | Completed, but one or more steps failed. Each failure is a line marked `[ERROR]` in the log |
 | 2 | Refused to run: not a workstation, not elevated, or not Windows PowerShell 5.1. Nothing was changed |
+| 3 | Only with `FailOnDrift`: completed with no errors, but drift was found and corrected |
 
-Running the script again is safe. It only redoes what is still needed.
+Errors take priority: a run with both errors and drift exits with 1.
+
+Running the script again is safe. It only changes what is not already correct.
 
 ## Reverting a change
 

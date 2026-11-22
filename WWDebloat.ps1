@@ -17,14 +17,36 @@
       4. Cleanup: Disk Cleanup (safe handlers only), component store cleanup, old temp files.
       5. Prints a read-only status of Microsoft Defender and BitLocker for the log.
 
+    Every setting is checked before it is written. Settings that are already correct are left
+    alone; anything that had to be changed is logged as a CHANGE line and counted as drift.
+    Use -EnforceOnly for scheduled daily runs (see README).
+
     What it never touches: BitLocker, Microsoft Defender (any setting), Windows Firewall,
     Windows Update, Windows services, the diagnostic data (telemetry) level, SSH, RDP, or any
     other remote-access or listening service. It downloads nothing from the internet.
 
     Log: %ProgramData%\WWDebloat\Logs\WWDebloat_<timestamp>.log (last 20 kept).
 
-    Exit codes: 0 = completed with no errors, 1 = completed with one or more errors (see log),
-                2 = refused to run (preflight check failed).
+    Exit codes: 0 = completed with no errors (and no drift, if -FailOnDrift is set),
+                1 = completed with one or more errors (see log),
+                2 = refused to run (preflight check failed),
+                3 = completed with no errors but drift was found and corrected (-FailOnDrift only).
+
+    The last line of output is always WWDEBLOAT_RESULT: errors=<n> drift=<n>, for NinjaOne
+    output conditions.
+
+.PARAMETER EnforceOnly
+    Mode for scheduled daily runs. Re-applies app removals and tweaks only. Implies
+    -SkipRestorePoint and -SkipCleanup, and never loads the registry of signed-out users or the
+    Default profile (so a user signing in during the run can never get a temporary profile).
+    Signed-out users are covered the next time a run happens while they are signed in.
+
+.PARAMETER FailOnDrift
+    Exit with code 3 when drift was found and corrected, so NinjaOne can alert on it.
+
+.PARAMETER DriftCustomField
+    Name of a NinjaOne custom field (text) to write a one-line drift summary to, for example
+    wwdebloatStatus. The field must allow write access from automations.
 
 .PARAMETER SkipRestorePoint
     Do not create a System Restore point before making changes.
@@ -63,10 +85,13 @@ param(
     [switch]$HideStartRecommendedSection,
     [switch]$ResetComponentBase,
     [ValidateRange(1, 365)]
-    [int]$TempFileAgeDays = 7
+    [int]$TempFileAgeDays = 7,
+    [switch]$EnforceOnly,
+    [switch]$FailOnDrift,
+    [string]$DriftCustomField = ''
 )
 
-$ScriptVersion = '1.0.0'
+$ScriptVersion = '1.1.0'
 
 # Errors are handled explicitly with -ErrorAction Stop inside try blocks. A global 'Stop' is
 # avoided on purpose: in Windows PowerShell 5.1 it turns stderr from native tools into
@@ -78,6 +103,9 @@ $ProgressPreference = 'SilentlyContinue'
 
 $script:ErrorCount = 0
 $script:WarningCount = 0
+$script:Changes = New-Object System.Collections.Generic.List[string]
+$script:AlreadyCorrect = 0
+$script:LoadOfflineHives = $true
 $LogRoot = Join-Path $env:ProgramData 'WWDebloat\Logs'
 if (-not (Test-Path -LiteralPath $LogRoot)) {
     New-Item -ItemType Directory -Path $LogRoot -Force | Out-Null
@@ -87,7 +115,7 @@ $LogFile = Join-Path $LogRoot ('WWDebloat_{0:yyyyMMdd_HHmmss}.log' -f (Get-Date)
 function Write-Log {
     param(
         [Parameter(Mandatory)][string]$Message,
-        [ValidateSet('INFO', 'OK', 'WARN', 'ERROR', 'STEP')][string]$Level = 'INFO'
+        [ValidateSet('INFO', 'OK', 'CHANGE', 'WARN', 'ERROR', 'STEP')][string]$Level = 'INFO'
     )
     if ($Level -eq 'STEP') {
         $line = ''
@@ -101,6 +129,13 @@ function Write-Log {
     Add-Content -LiteralPath $LogFile -Value $line -Encoding UTF8
     if ($Level -eq 'ERROR') { $script:ErrorCount++ }
     if ($Level -eq 'WARN') { $script:WarningCount++ }
+}
+
+function Add-Change {
+    # Records something that was not in the desired state and had to be changed (drift).
+    param([Parameter(Mandatory)][string]$Description)
+    $script:Changes.Add($Description)
+    Write-Log $Description 'CHANGE'
 }
 
 function Remove-OldLogs {
@@ -127,6 +162,17 @@ $SkipTweaks                  = Get-EnvFlag 'SkipTweaks' $SkipTweaks.IsPresent
 $SkipCleanup                 = Get-EnvFlag 'SkipCleanup' $SkipCleanup.IsPresent
 $HideStartRecommendedSection = Get-EnvFlag 'HideStartRecommendedSection' $HideStartRecommendedSection.IsPresent
 $ResetComponentBase          = Get-EnvFlag 'ResetComponentBase' $ResetComponentBase.IsPresent
+$EnforceOnly                 = Get-EnvFlag 'EnforceOnly' $EnforceOnly.IsPresent
+$FailOnDrift                 = Get-EnvFlag 'FailOnDrift' $FailOnDrift.IsPresent
+
+$envField = [Environment]::GetEnvironmentVariable('DriftCustomField')
+if (-not [string]::IsNullOrWhiteSpace($envField)) { $DriftCustomField = $envField.Trim() }
+
+if ($EnforceOnly) {
+    $SkipRestorePoint = $true
+    $SkipCleanup = $true
+    $script:LoadOfflineHives = $false
+}
 
 $envAge = [Environment]::GetEnvironmentVariable('TempFileAgeDays')
 if (-not [string]::IsNullOrWhiteSpace($envAge)) {
@@ -153,6 +199,9 @@ if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProces
         if ($SkipCleanup) { $relaunchArgs += '-SkipCleanup' }
         if ($HideStartRecommendedSection) { $relaunchArgs += '-HideStartRecommendedSection' }
         if ($ResetComponentBase) { $relaunchArgs += '-ResetComponentBase' }
+        if ($EnforceOnly) { $relaunchArgs += '-EnforceOnly' }
+        if ($FailOnDrift) { $relaunchArgs += '-FailOnDrift' }
+        if ($DriftCustomField) { $relaunchArgs += @('-DriftCustomField', $DriftCustomField) }
         $relaunchArgs += @('-TempFileAgeDays', $TempFileAgeDays)
         & $ps64 @relaunchArgs
         exit $LASTEXITCODE
@@ -196,26 +245,45 @@ function Set-RegValue {
         [ValidateSet('DWord', 'String', 'ExpandString', 'QWord')][string]$Type = 'DWord',
         [string]$Context = ''
     )
+    $where = if ($Context) { ' [{0}]' -f $Context } else { '' }
     try {
-        # Only create the key when missing. New-Item -Force on an existing registry key would
-        # wipe every value already stored under it.
-        if (-not (Test-Path -LiteralPath $Path)) {
+        $keyExists = Test-Path -LiteralPath $Path
+        $before = '(not set)'
+        if ($keyExists) {
+            $key = Get-Item -LiteralPath $Path -ErrorAction Stop
+            try {
+                if ($key.GetValueNames() -contains $Name) {
+                    $current = $key.GetValue($Name, $null, 'DoNotExpandEnvironmentNames')
+                    $kind = $key.GetValueKind($Name).ToString()
+                    if ($kind -eq $Type -and [string]$current -eq [string]$Value) {
+                        $script:AlreadyCorrect++
+                        return
+                    }
+                    $before = '{0} ({1})' -f $current, $kind
+                }
+            } finally {
+                $key.Close()
+            }
+        } else {
+            # Only create the key when missing. New-Item -Force on an existing registry key
+            # would wipe every value already stored under it.
             New-Item -Path $Path -Force -ErrorAction Stop | Out-Null
         }
         New-ItemProperty -LiteralPath $Path -Name $Name -Value $Value -PropertyType $Type -Force -ErrorAction Stop | Out-Null
-        $where = if ($Context) { ' [{0}]' -f $Context } else { '' }
-        Write-Log ('Set {0}\{1} = {2}{3}' -f $Path, $Name, $Value, $where) 'OK'
+        Add-Change ('{0}\{1}: {2} -> {3}{4}' -f $Path, $Name, $before, $Value, $where)
     } catch {
-        Write-Log ('Failed to set {0}\{1}: {2}' -f $Path, $Name, $_.Exception.Message) 'ERROR'
+        Write-Log ('Failed to set {0}\{1}{2}: {3}' -f $Path, $Name, $where, $_.Exception.Message) 'ERROR'
     }
 }
 
 function New-RegKey {
     param([Parameter(Mandatory)][string]$Path)
     try {
-        if (-not (Test-Path -LiteralPath $Path)) {
+        if (Test-Path -LiteralPath $Path) {
+            $script:AlreadyCorrect++
+        } else {
             New-Item -Path $Path -Force -ErrorAction Stop | Out-Null
-            Write-Log ('Created key {0}' -f $Path) 'OK'
+            Add-Change ('Created key {0}' -f $Path)
         }
     } catch {
         Write-Log ('Failed to create key {0}: {1}' -f $Path, $_.Exception.Message) 'ERROR'
@@ -265,6 +333,9 @@ function Invoke-ForEachUserHive {
         $mountName = $null
         if ($target.Sid -and (Test-Path -LiteralPath ('Registry::HKEY_USERS\{0}' -f $target.Sid))) {
             $root = 'Registry::HKEY_USERS\{0}' -f $target.Sid
+        } elseif (-not $script:LoadOfflineHives) {
+            # EnforceOnly: never load a hive Windows is not already using.
+            continue
         } else {
             if (-not (Test-Path -LiteralPath $target.Hive)) {
                 Write-Log ('No NTUSER.DAT for {0}, skipping.' -f $target.Label)
@@ -373,6 +444,17 @@ $script:WidgetApps = @(
     @{ Label = 'Widgets Platform Runtime';    Name = 'Microsoft.WidgetsPlatformRuntime';        Pfn = 'Microsoft.WidgetsPlatformRuntime_8wekyb3d8bbwe' }
 )
 
+# Processes to stop before removing a package, so removal does not fail on locked files.
+# Only stopped when the package is actually found.
+$script:AppProcesses = @{
+    'Microsoft.XboxGamingOverlay'           = @('GameBar', 'GameBarFTServer')
+    'Microsoft.YourPhone'                   = @('PhoneExperienceHost')
+    'MicrosoftWindows.CrossDevice'          = @('CrossDeviceService')
+    'MicrosoftCorporationII.QuickAssist'    = @('QuickAssist')
+    'Clipchamp.Clipchamp'                   = @('Clipchamp')
+    'MicrosoftWindows.Client.WebExperience' = @('Widgets', 'WidgetService')
+}
+
 $script:ProvisionedPackages = $null
 
 function Get-ProvisionedPackageCache {
@@ -391,21 +473,28 @@ function Remove-AppEverywhere {
     param([Parameter(Mandatory)][hashtable]$App)
 
     $found = $false
+    $provisioned = @(Get-ProvisionedPackageCache | Where-Object { $_.DisplayName -eq $App.Name })
+    $installed = @(Get-AppxPackage -AllUsers -Name $App.Name -ErrorAction SilentlyContinue |
+        Sort-Object -Property PackageFullName -Unique)
+
+    if (($provisioned.Count + $installed.Count) -gt 0 -and $script:AppProcesses.ContainsKey($App.Name)) {
+        foreach ($procName in $script:AppProcesses[$App.Name]) {
+            Get-Process -Name $procName -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        }
+    }
 
     # 1. Provisioned copy: stops the app being installed into new user profiles.
-    foreach ($prov in @(Get-ProvisionedPackageCache | Where-Object { $_.DisplayName -eq $App.Name })) {
+    foreach ($prov in $provisioned) {
         $found = $true
         try {
             Remove-AppxProvisionedPackage -Online -PackageName $prov.PackageName -ErrorAction Stop | Out-Null
-            Write-Log ('{0}: removed provisioned package {1}' -f $App.Label, $prov.PackageName) 'OK'
+            Add-Change ('{0}: removed provisioned package {1}' -f $App.Label, $prov.PackageName)
         } catch {
             Write-Log ('{0}: failed to remove provisioned package {1}: {2}' -f $App.Label, $prov.PackageName, $_.Exception.Message) 'ERROR'
         }
     }
 
     # 2. Installed copies, for every user.
-    $installed = @(Get-AppxPackage -AllUsers -Name $App.Name -ErrorAction SilentlyContinue |
-        Sort-Object -Property PackageFullName -Unique)
     foreach ($pkg in $installed) {
         $found = $true
         if ($pkg.PSObject.Properties['NonRemovable'] -and $pkg.NonRemovable) {
@@ -414,7 +503,7 @@ function Remove-AppEverywhere {
         }
         try {
             Remove-AppxPackage -Package $pkg.PackageFullName -AllUsers -ErrorAction Stop
-            Write-Log ('{0}: removed {1} for all users' -f $App.Label, $pkg.PackageFullName) 'OK'
+            Add-Change ('{0}: removed {1} for all users' -f $App.Label, $pkg.PackageFullName)
         } catch {
             # Some builds refuse -AllUsers for per-user installs when run as SYSTEM. Fall back to
             # removing it user by user.
@@ -431,7 +520,7 @@ function Remove-AppEverywhere {
                 }
             }
             if ($userInfo.Count -gt 0 -and $userFailures -eq 0) {
-                Write-Log ('{0}: removed {1} user by user' -f $App.Label, $pkg.PackageFullName) 'OK'
+                Add-Change ('{0}: removed {1} user by user' -f $App.Label, $pkg.PackageFullName)
             } else {
                 Write-Log ('{0}: failed to remove {1}: {2}' -f $App.Label, $pkg.PackageFullName, $allUsersError) 'ERROR'
             }
@@ -442,18 +531,11 @@ function Remove-AppEverywhere {
     #    an app. Delete this key to allow the app to come back.
     New-RegKey -Path ('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Appx\AppxAllUserStore\Deprovisioned\{0}' -f $App.Pfn)
 
-    if (-not $found) {
-        Write-Log ('{0}: not present.' -f $App.Label)
-    }
+    if (-not $found) { $script:AlreadyCorrect++ }
 }
 
 function Invoke-AppRemoval {
     Write-Log 'App removal' 'STEP'
-
-    # Stop running instances so removal does not fail on locked files.
-    foreach ($procName in @('GameBar', 'GameBarFTServer', 'PhoneExperienceHost', 'CrossDeviceService', 'QuickAssist', 'Clipchamp')) {
-        Get-Process -Name $procName -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-    }
 
     foreach ($app in $script:BloatApps) {
         Remove-AppEverywhere -App $app
@@ -463,7 +545,7 @@ function Invoke-AppRemoval {
     try {
         foreach ($cap in @(Get-WindowsCapability -Online -Name 'App.Support.QuickAssist*' -ErrorAction Stop | Where-Object { $_.State -eq 'Installed' })) {
             Remove-WindowsCapability -Online -Name $cap.Name -ErrorAction Stop | Out-Null
-            Write-Log ('Quick Assist: removed Windows capability {0}' -f $cap.Name) 'OK'
+            Add-Change ('Quick Assist: removed Windows capability {0}' -f $cap.Name)
         }
     } catch {
         Write-Log ('Quick Assist: could not check or remove the legacy capability: {0}' -f $_.Exception.Message) 'WARN'
@@ -526,12 +608,13 @@ function Set-WindowsAI {
         $recall = Get-WindowsOptionalFeature -Online -FeatureName 'Recall' -ErrorAction Stop
         if ($recall -and $recall.State -eq 'Enabled') {
             Disable-WindowsOptionalFeature -Online -FeatureName 'Recall' -NoRestart -ErrorAction Stop | Out-Null
-            Write-Log 'Recall optional feature disabled (takes effect after restart).' 'OK'
+            Add-Change 'Recall optional feature disabled (takes effect after restart)'
         } else {
-            Write-Log 'Recall optional feature is not enabled.'
+            $script:AlreadyCorrect++
         }
     } catch {
-        Write-Log 'Recall optional feature is not present on this PC.'
+        # Not a Copilot+ PC: the Recall feature does not exist here.
+        $script:AlreadyCorrect++
     }
 }
 
@@ -563,9 +646,6 @@ function Set-EdgeDebloat {
 
 function Set-RemoveWidgets {
     Write-Log 'Tweak: Remove Widgets' 'STEP'
-    foreach ($procName in @('Widgets', 'WidgetService')) {
-        Get-Process -Name $procName -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-    }
     foreach ($app in $script:WidgetApps) {
         Remove-AppEverywhere -App $app
     }
@@ -580,13 +660,17 @@ function Set-Wpbt {
 
 function Set-LogitechBlock {
     Write-Log 'Tweak: Block Logitech Download Assistant' 'STEP'
-    Get-Process -Name 'logi_download_assistant' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    $logiProcs = @(Get-Process -Name 'logi_download_assistant' -ErrorAction SilentlyContinue)
+    if ($logiProcs.Count -gt 0) {
+        $logiProcs | Stop-Process -Force -ErrorAction SilentlyContinue
+        Add-Change 'Stopped running Logitech Download Assistant'
+    }
 
     foreach ($runKey in @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run')) {
         $runValues = Get-ItemProperty -LiteralPath $runKey -ErrorAction SilentlyContinue
         if ($runValues -and $runValues.PSObject.Properties['Logitech Download Assistant']) {
             Remove-ItemProperty -LiteralPath $runKey -Name 'Logitech Download Assistant' -ErrorAction SilentlyContinue
-            Write-Log ('Removed Logitech Download Assistant startup entry from {0}' -f $runKey) 'OK'
+            Add-Change ('Removed Logitech Download Assistant startup entry from {0}' -f $runKey)
         }
     }
 
@@ -594,17 +678,34 @@ function Set-LogitechBlock {
     $logiPath = Join-Path $programFiles64 'LogiDownloadAssistant'
     try {
         if (Test-Path -LiteralPath $logiPath) {
-            Get-ChildItem -LiteralPath $logiPath -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction Stop
-            Write-Log ('Emptied {0}' -f $logiPath) 'OK'
+            $contents = @(Get-ChildItem -LiteralPath $logiPath -Force -ErrorAction SilentlyContinue)
+            if ($contents.Count -gt 0) {
+                $contents | Remove-Item -Recurse -Force -ErrorAction Stop
+                Add-Change ('Emptied {0} ({1} items)' -f $logiPath, $contents.Count)
+            }
         } else {
             New-Item -ItemType Directory -Path $logiPath -Force -ErrorAction Stop | Out-Null
         }
+
         # Deny write to Everyone so Windows Update driver packages cannot reinstall it.
-        $icaclsOutput = & icacls.exe $logiPath /deny '*S-1-1-0:(W)' 2>&1 | Out-String
-        if ($LASTEXITCODE -eq 0) {
-            Write-Log ('Denied write access on {0}' -f $logiPath) 'OK'
+        $everyone = 'S-1-1-0'
+        $hasDeny = $false
+        $acl = Get-Acl -LiteralPath $logiPath -ErrorAction Stop
+        foreach ($rule in $acl.GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier])) {
+            if ($rule.AccessControlType -eq 'Deny' -and $rule.IdentityReference.Value -eq $everyone -and
+                ($rule.FileSystemRights -band [Security.AccessControl.FileSystemRights]::WriteData)) {
+                $hasDeny = $true
+            }
+        }
+        if ($hasDeny) {
+            $script:AlreadyCorrect++
         } else {
-            Write-Log ('icacls failed on {0}: {1}' -f $logiPath, $icaclsOutput.Trim()) 'ERROR'
+            $icaclsOutput = & icacls.exe $logiPath /deny ('*{0}:(W)' -f $everyone) 2>&1 | Out-String
+            if ($LASTEXITCODE -eq 0) {
+                Add-Change ('Denied write access on {0}' -f $logiPath)
+            } else {
+                Write-Log ('icacls failed on {0}: {1}' -f $logiPath, $icaclsOutput.Trim()) 'ERROR'
+            }
         }
     } catch {
         Write-Log ('Logitech block failed: {0}' -f $_.Exception.Message) 'ERROR'
@@ -828,18 +929,47 @@ function Write-SecurityStatus {
 
 #region Main --------------------------------------------------------------------------------------
 
-Write-Log ('WWDebloat {0} starting' -f $ScriptVersion) 'STEP'
-Write-Log ('Options: SkipRestorePoint={0} SkipAppRemoval={1} SkipTweaks={2} SkipCleanup={3} HideStartRecommendedSection={4} ResetComponentBase={5} TempFileAgeDays={6}' -f `
-    $SkipRestorePoint, $SkipAppRemoval, $SkipTweaks, $SkipCleanup, $HideStartRecommendedSection, $ResetComponentBase, $TempFileAgeDays)
+function Set-NinjaDriftField {
+    param([string]$FieldName, [string]$Value)
+    if ([string]::IsNullOrWhiteSpace($FieldName)) { return }
+    try {
+        if (Get-Command -Name 'Ninja-Property-Set' -ErrorAction SilentlyContinue) {
+            Ninja-Property-Set $FieldName $Value | Out-Null
+        } else {
+            $cli = Join-Path $env:ProgramData 'NinjaRMMAgent\ninjarmm-cli.exe'
+            if (-not (Test-Path -LiteralPath $cli)) {
+                Write-Log ('NinjaOne agent not found; custom field {0} not updated.' -f $FieldName) 'WARN'
+                return
+            }
+            $cliOutput = & $cli set $FieldName $Value 2>&1 | Out-String
+            if ($LASTEXITCODE -ne 0) { throw $cliOutput.Trim() }
+        }
+        Write-Log ('NinjaOne custom field {0} = {1}' -f $FieldName, $Value)
+    } catch {
+        Write-Log ('Could not update NinjaOne custom field {0}: {1}' -f $FieldName, $_.Exception.Message) 'WARN'
+    }
+}
+
+$mode = if ($EnforceOnly) { 'EnforceOnly' } else { 'Full' }
+Write-Log ('WWDebloat {0} starting ({1} mode)' -f $ScriptVersion, $mode) 'STEP'
+Write-Log ('Options: SkipRestorePoint={0} SkipAppRemoval={1} SkipTweaks={2} SkipCleanup={3} HideStartRecommendedSection={4} ResetComponentBase={5} TempFileAgeDays={6} FailOnDrift={7} DriftCustomField={8}' -f `
+    $SkipRestorePoint, $SkipAppRemoval, $SkipTweaks, $SkipCleanup, $HideStartRecommendedSection, $ResetComponentBase, $TempFileAgeDays, $FailOnDrift, $DriftCustomField)
 Write-Log ('Log file: {0}' -f $LogFile)
 
 if (-not (Test-Preflight)) {
     Write-Log 'Preflight failed. No changes were made.' 'ERROR'
+    Write-Host ('WWDEBLOAT_RESULT: errors={0} drift=0' -f $script:ErrorCount)
     exit 2
 }
 
 $script:UserHiveTargets = Get-UserHiveTargets
-Write-Log ('User profiles found: {0} (plus Default profile)' -f @($script:UserHiveTargets | Where-Object { $_.Sid }).Count)
+$realProfiles = @($script:UserHiveTargets | Where-Object { $_.Sid })
+if ($script:LoadOfflineHives) {
+    Write-Log ('User profiles found: {0} (plus Default profile)' -f $realProfiles.Count)
+} else {
+    $signedIn = @($realProfiles | Where-Object { Test-Path -LiteralPath ('Registry::HKEY_USERS\{0}' -f $_.Sid) })
+    Write-Log ('User profiles found: {0}. EnforceOnly: checking the {1} signed-in profile(s); signed-out profiles and the Default profile are left for the next run.' -f $realProfiles.Count, $signedIn.Count)
+}
 
 if (-not $SkipRestorePoint) { New-PreChangeRestorePoint }
 
@@ -865,11 +995,31 @@ if (-not $SkipCleanup) {
 Write-SecurityStatus
 Remove-OldLogs
 
+$driftCount = $script:Changes.Count
 Write-Log 'Summary' 'STEP'
+Write-Log ('Already correct: {0} item(s). Changed (drift corrected): {1} item(s).' -f $script:AlreadyCorrect, $driftCount)
+foreach ($change in $script:Changes) {
+    Write-Log ('  - {0}' -f $change)
+}
 Write-Log ('Finished with {0} error(s) and {1} warning(s).' -f $script:ErrorCount, $script:WarningCount)
-Write-Log 'A restart (or sign out and back in) is needed for Start menu, taskbar and search changes to appear. This script does not restart the PC.'
+if ($driftCount -gt 0) {
+    Write-Log 'A restart (or sign out and back in) is needed for Start menu, taskbar and search changes to appear. This script does not restart the PC.'
+}
+
+$stamp = Get-Date -Format 'yyyy-MM-dd HH:mm'
+if ($script:ErrorCount -gt 0) {
+    $fieldValue = '{0} | ERRORS | {1} error(s), {2} drift item(s) corrected ({3})' -f $stamp, $script:ErrorCount, $driftCount, $mode
+} elseif ($driftCount -gt 0) {
+    $fieldValue = '{0} | DRIFT | {1} item(s) corrected ({2})' -f $stamp, $driftCount, $mode
+} else {
+    $fieldValue = '{0} | OK | no drift ({1})' -f $stamp, $mode
+}
+Set-NinjaDriftField -FieldName $DriftCustomField -Value $fieldValue
+
+Write-Host ('WWDEBLOAT_RESULT: errors={0} drift={1}' -f $script:ErrorCount, $driftCount)
 
 if ($script:ErrorCount -gt 0) { exit 1 }
+if ($FailOnDrift -and $driftCount -gt 0) { exit 3 }
 exit 0
 
 #endregion
